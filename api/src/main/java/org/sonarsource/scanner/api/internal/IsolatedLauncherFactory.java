@@ -56,7 +56,7 @@ public class IsolatedLauncherFactory implements Closeable {
     return classloader;
   }
 
-  public IsolatedLauncher createLauncher(Map<String, String> props, ClassloadRules rules) {
+  public IsolatedLauncher createLauncher(Map<String, String> props, ClassloadRules rules, JarDownloader jarDownloader) {
     if (props.containsKey(InternalProperties.SCANNER_DUMP_TO_FILE)) {
       String version = props.get(InternalProperties.SCANNER_VERSION_SIMULATION);
       if (version == null) {
@@ -64,8 +64,6 @@ public class IsolatedLauncherFactory implements Closeable {
       }
       return new SimulatedLauncher(version, logger);
     }
-    ServerConnection serverConnection = ServerConnection.create(props, logger);
-    JarDownloader jarDownloader = new JarDownloaderFactory(serverConnection, logger, props.get("sonar.userHome")).create();
 
     return createLauncher(jarDownloader, rules);
   }

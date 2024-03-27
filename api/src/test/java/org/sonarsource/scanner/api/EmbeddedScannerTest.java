@@ -34,7 +34,9 @@ import org.junit.rules.ExpectedException;
 import org.junit.rules.TemporaryFolder;
 import org.mockito.ArgumentMatcher;
 import org.sonarsource.scanner.api.internal.ClassloadRules;
+import org.sonarsource.scanner.api.internal.InternalProperties;
 import org.sonarsource.scanner.api.internal.IsolatedLauncherFactory;
+import org.sonarsource.scanner.api.internal.JarDownloader;
 import org.sonarsource.scanner.api.internal.batch.IsolatedLauncher;
 import org.sonarsource.scanner.api.internal.cache.Logger;
 
@@ -73,8 +75,10 @@ public class EmbeddedScannerTest {
     system = mock(System2.class);
 
     when(launcher.getVersion()).thenReturn("5.2");
-    when(launcherFactory.createLauncher(anyMap(), any(ClassloadRules.class))).thenReturn(launcher);
+    when(launcherFactory.createLauncher(anyMap(), any(ClassloadRules.class), any(JarDownloader.class))).thenReturn(launcher);
     scanner = new EmbeddedScanner(launcherFactory, logger, mock(LogOutput.class), system);
+
+    scanner.globalProperties().put(InternalProperties.SCANNER_DUMP_TO_FILE, "true");
   }
 
   @Test
@@ -99,29 +103,10 @@ public class EmbeddedScannerTest {
   }
 
   @Test
-  public void should_set_localhost_as_host_by_default() {
+  public void should_set_sonarcloud_as_host_by_default() {
     scanner.start();
 
-    assertThat(scanner.globalProperty("sonar.host.url", null)).isEqualTo("http://localhost:9000");
-  }
-
-  @Test
-  public void should_set_sonarcloud_as_host_if_executed_from_bitbucket_cloud_and_no_host_env() {
-    when(system.getEnvironmentVariable("BITBUCKET_BUILD_NUMBER")).thenReturn("123");
-
-    scanner.start();
-
-    assertThat(scanner.globalProperty("sonar.host.url", null)).isEqualTo("https://sonarcloud.io");
-  }
-
-  @Test
-  public void should_set_url_from_env_as_host_if_host_env_var_provided_even_on_bitbucket_cloud() {
-    when(system.getEnvironmentVariable("BITBUCKET_BUILD_NUMBER")).thenReturn("123");
-    when(system.getEnvironmentVariable("SONAR_HOST_URL")).thenReturn("http://from-env.org:9000");
-
-    scanner.start();
-
-    assertThat(scanner.globalProperty("sonar.host.url", null)).isEqualTo("http://from-env.org:9000");
+    assertThat(scanner.globalProperty("sonar.host.url", null)).isEqualTo(EmbeddedScanner.SONARCLOUD_HOST);
   }
 
   @Test
@@ -161,7 +146,7 @@ public class EmbeddedScannerTest {
       public boolean matches(Map o) {
         return "foo".equals(o.get("sonar.projectKey"));
       }
-    }), any(ClassloadRules.class));
+    }), any(ClassloadRules.class), any(JarDownloader.class));
 
     // it should have added a few properties to analysisProperties
     final String[] mustHaveKeys = {"sonar.working.directory", "sonar.sourceEncoding", "sonar.projectBaseDir"};
@@ -193,7 +178,7 @@ public class EmbeddedScannerTest {
       public boolean matches(Map o) {
         return "foo".equals(o.get("sonar.projectKey"));
       }
-    }), any(ClassloadRules.class));
+    }), any(ClassloadRules.class), any(JarDownloader.class));
 
     verify(launcher).execute(argThat(new ArgumentMatcher<Map>() {
       @Override

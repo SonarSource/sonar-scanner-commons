@@ -30,6 +30,7 @@ import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
+import org.sonarsource.scanner.api.ScannerProperties;
 import org.sonarsource.scanner.api.Utils;
 import org.sonarsource.scanner.api.internal.cache.Logger;
 
@@ -37,7 +38,7 @@ import static java.lang.String.format;
 import static org.sonarsource.scanner.api.internal.InternalProperties.SCANNER_APP;
 import static org.sonarsource.scanner.api.internal.InternalProperties.SCANNER_APP_VERSION;
 
-class ServerConnection {
+public class ServerConnection {
 
   private final String baseUrlWithoutTrailingSlash;
   private final String userAgent;
@@ -57,7 +58,7 @@ class ServerConnection {
   }
 
   public static ServerConnection create(Map<String, String> props, Logger logger) {
-    String serverUrl = props.get("sonar.host.url");
+    String serverUrl = props.get(ScannerProperties.HOST_URL);
     String userAgent = format("%s/%s", props.get(SCANNER_APP), props.get(SCANNER_APP_VERSION));
     return new ServerConnection(serverUrl, userAgent, logger);
   }
@@ -98,6 +99,14 @@ class ServerConnection {
     logger.debug(format("Download: %s", url));
     try (ResponseBody responseBody = callUrl(url)) {
       return responseBody.string();
+    }
+  }
+
+  public String getServerVersion() {
+    try {
+      return downloadString("/api/server/version");
+    } catch (IOException e) {
+      throw new IllegalStateException("Failed to get server version", e);
     }
   }
 

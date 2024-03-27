@@ -19,8 +19,10 @@
  */
 package org.sonarsource.scanner.api;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.charset.Charset;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Locale;
@@ -31,8 +33,21 @@ import javax.annotation.Nullable;
 import org.sonarsource.scanner.api.internal.ClassloadRules;
 import org.sonarsource.scanner.api.internal.InternalProperties;
 import org.sonarsource.scanner.api.internal.IsolatedLauncherFactory;
+import org.sonarsource.scanner.api.internal.JarDownloader;
+import org.sonarsource.scanner.api.internal.JarDownloaderFactory;
+import org.sonarsource.scanner.api.internal.JavaRunner;
+import org.sonarsource.scanner.api.internal.JreDownloader;
+import org.sonarsource.scanner.api.internal.OsArchProvider;
+import org.sonarsource.scanner.api.internal.ScannerEngineLauncher;
+import org.sonarsource.scanner.api.internal.ServerConnection;
+import org.sonarsource.scanner.api.internal.VersionUtils;
 import org.sonarsource.scanner.api.internal.batch.IsolatedLauncher;
+import org.sonarsource.scanner.api.internal.cache.FileCache;
+import org.sonarsource.scanner.api.internal.cache.FileCacheBuilder;
 import org.sonarsource.scanner.api.internal.cache.Logger;
+
+import static org.sonarsource.scanner.api.ScannerProperties.SCANNER_JAVA_EXECUTABLE;
+import static org.sonarsource.scanner.api.ScannerProperties.USER_HOME;
 
 /**
  * Entry point to run SonarQube analysis programmatically.
@@ -40,11 +55,12 @@ import org.sonarsource.scanner.api.internal.cache.Logger;
  * @since 2.2
  */
 public class EmbeddedScanner {
-  private static final String BITBUCKET_CLOUD_ENV_VAR = "BITBUCKET_BUILD_NUMBER";
   private static final String SONAR_HOST_URL_ENV_VAR = "SONAR_HOST_URL";
-  private static final String SONARCLOUD_HOST = "https://sonarcloud.io";
+  static final String SONARCLOUD_HOST = "https://sonarcloud.io";
   private final IsolatedLauncherFactory launcherFactory;
   private IsolatedLauncher launcher;
+  private ServerConnection serverConnection;
+  private ScannerEngineLauncher scannerEngineLauncher;
   private final LogOutput logOutput;
   private final Map<String, String> globalProperties = new HashMap<>();
   private final Logger logger;
@@ -124,20 +140,33 @@ public class EmbeddedScanner {
   }
 
   public String serverVersion() {
-    checkLauncherExists();
-    return launcher.getVersion();
+    if (isSimulation()) {
+      checkLauncherExists();
+      return launcher.getVersion();
+    } else {
+      if (serverConnection != null) {
+        return serverConnection.getServerVersion();
+      } else {
+        throw new IllegalStateException("Server connection not initialized");
+      }
+    }
   }
 
   public void execute(Map<String, String> taskProps) {
-    checkLauncherExists();
-    try (IsolatedLauncherFactory launcherFactoryToBeClosed = launcherFactory) {
-      Map<String, String> allProps = new HashMap<>();
-      allProps.putAll(globalProperties);
-      allProps.putAll(taskProps);
-      initAnalysisProperties(allProps);
-      doExecute(allProps);
-    } catch (IOException e) {
-      throw new IllegalStateException(e.getMessage(), e);
+    Map<String, String> allProps = new HashMap<>();
+    allProps.putAll(globalProperties);
+    allProps.putAll(taskProps);
+    initAnalysisProperties(allProps);
+
+    if (scannerEngineLauncher != null) {
+      scannerEngineLauncher.execute(allProps);
+    } else {
+      checkLauncherExists();
+      try (IsolatedLauncherFactory launcherFactoryToBeClosed = launcherFactory) {
+        doExecute(allProps);
+      } catch (IOException e) {
+        throw new IllegalStateException(e.getMessage(), e);
+      }
     }
   }
 
@@ -145,11 +174,9 @@ public class EmbeddedScanner {
     String sonarHostUrl = system.getEnvironmentVariable(SONAR_HOST_URL_ENV_VAR);
     if (sonarHostUrl != null) {
       setGlobalDefaultValue(ScannerProperties.HOST_URL, sonarHostUrl);
-    } else if (system.getEnvironmentVariable(BITBUCKET_CLOUD_ENV_VAR) != null) {
-      setGlobalDefaultValue(ScannerProperties.HOST_URL, SONARCLOUD_HOST);
-      logger.info("Bitbucket Cloud Pipelines detected, no host variable set. Defaulting to sonarcloud.io.");
     } else {
-      setGlobalDefaultValue(ScannerProperties.HOST_URL, "http://localhost:9000");
+      String sonarcloudUrl = globalProperties.getOrDefault(ScannerProperties.SONARCLOUD_URL, SONARCLOUD_HOST);
+      setGlobalDefaultValue(ScannerProperties.HOST_URL, sonarcloudUrl);
     }
   }
 
@@ -180,9 +207,58 @@ public class EmbeddedScanner {
   }
 
   protected void doStart() {
-    checkLauncherDoesntExist();
-    ClassloadRules rules = new ClassloadRules(classloaderMask, classloaderUnmask);
-    launcher = launcherFactory.createLauncher(globalProperties(), rules);
+    serverConnection = ServerConnection.create(globalProperties(), logger);
+    FileCache fileCache = new FileCacheBuilder(logger)
+      .setUserHome(globalProperties.get(USER_HOME))
+      .build();
+    JarDownloader jarDownloader = new JarDownloaderFactory(serverConnection, logger, fileCache).create();
+
+    if (!isSimulation() && (isSonarCloud(globalProperties) || VersionUtils.isAtLeast(serverConnection.getServerVersion(), "10.5"))) {
+      JavaRunner javaRunner = setUpJre(serverConnection, fileCache, logger);
+      File scannerEngine = jarDownloader.getScannerEngineFiles().get(0);
+      scannerEngineLauncher = new ScannerEngineLauncher(javaRunner, scannerEngine, logger);
+    } else {
+      checkLauncherDoesntExist();
+      ClassloadRules rules = new ClassloadRules(classloaderMask, classloaderUnmask);
+      launcher = launcherFactory.createLauncher(globalProperties(), rules, jarDownloader);
+    }
+  }
+
+  private boolean isSimulation() {
+    return globalProperties.containsKey(InternalProperties.SCANNER_DUMP_TO_FILE);
+  }
+
+  private static boolean isSonarCloud(Map<String, String> props) {
+    if (props.containsKey(ScannerProperties.SONARCLOUD_URL)) {
+      return true;
+    }
+    String hostUrl = props.get(ScannerProperties.HOST_URL);
+    if (hostUrl != null) {
+      return hostUrl.toLowerCase(Locale.ENGLISH).contains("sonarcloud");
+    }
+    return true;
+  }
+
+  private JavaRunner setUpJre(ServerConnection serverConnection, FileCache fileCache, Logger logger) {
+    File javaExecutable;
+    String javaExecutableProp = globalProperties.get(SCANNER_JAVA_EXECUTABLE);
+    if (javaExecutableProp != null) {
+      javaExecutable = new File(javaExecutableProp);
+      this.logger.info(String.format("JRE auto-provisioning is disabled, the java executable %s will be used.", javaExecutableProp));
+    } else {
+      OsArchProvider.OsArch osArch = new OsArchProvider(system, this.logger).getOsArch(globalProperties);
+      this.logger.info("JRE auto-provisioning: " + osArch);
+
+      javaExecutable = new JreDownloader(serverConnection, fileCache).download(osArch);
+    }
+
+    JavaRunner javaRunner = new JavaRunner(javaExecutable, logger);
+    jreSanityCheck(javaRunner);
+    return javaRunner;
+  }
+
+  private static void jreSanityCheck(JavaRunner javaRunner) {
+    javaRunner.execute(Collections.singletonList("--version"), null);
   }
 
   protected void doExecute(Map<String, String> properties) {
